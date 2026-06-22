@@ -9,7 +9,9 @@ set -euo pipefail
 BASE="${TELEREADER_BASE_URL:-https://telereader.ai}"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/telereader"
 TOKEN_FILE="$CONFIG_DIR/token"
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# CDPATH= disables CDPATH lookup (a multi-entry CDPATH can make `cd <relative>`
+# resolve elsewhere and echo the path, corrupting this capture); -- guards odd dirs.
+HERE="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 command -v jq >/dev/null 2>&1 || { echo "error: 'jq' is required (see the repo README)"; exit 1; }
 
