@@ -1,8 +1,12 @@
+<p align="center">
+  <img src="assets/banner.png" alt="Telereader skills — turn any text into a narrated audiobook" width="100%">
+</p>
+
 # Telereader skills
 
-Agent skills for [Telereader](https://telereader.ai) — turn any text, article, or
-document into a **narrated audiobook** the user can open in a browser and listen
-to, with the words lit up in sync with the voice.
+Agent skills for [Telereader](https://telereader.ai). Paste an article, a
+markdown doc, or a file, and get back an openable reader URL — the text read
+aloud, with the words lit up in time with the voice.
 
 ## Available skills
 
@@ -18,7 +22,7 @@ npx skills add telereaderai/skills
 
 This installs the skill into your coding agent (Claude Code, Cursor, Codex,
 Copilot, Cline, Windsurf, …). Then onboard once — the script prints a browser
-approval link for you to approve, and saves a reading-scoped token:
+approval link to approve, and saves a reading-scoped token:
 
 ```bash
 # path is printed by the installer, e.g.
@@ -42,8 +46,8 @@ connect the hosted **MCP server** — no skill install needed:
 - Exposes a **`generate_audiobook`** tool.
 - Per-client setup: <https://telereader.ai/docs/api/agents>
 
-The skill and the MCP server hit the same API, on the same account, and return the
-same reader URL.
+The skill and the MCP server hit the same API, on the same account, and return
+the same reader URL.
 
 ## License
 
