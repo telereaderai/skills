@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Telereader skill — one-time device-grant onboarding (RFC 8628).
+# Requests a device code, hands the human a browser approval link, polls for the
+# token, and saves it (mode 0600) to ~/.config/telereader/token. No secret is
+# ever printed.
+set -euo pipefail
+
+BASE="${TELEREADER_BASE_URL:-https://telereader.ai}"
+CLIENT_ID="${TELEREADER_CLIENT_ID:-tlread}"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/telereader"
+TOKEN_FILE="$CONFIG_DIR/token"
+
+for dep in curl jq; do
+  command -v "$dep" >/dev/null 2>&1 || { echo "error: '$dep' is required (see the repo README)"; exit 1; }
+done
+
+resp="$(curl -fsS -X POST "$BASE/api/auth/device/code" \
+  -H 'content-type: application/json' -d "{\"client_id\":\"$CLIENT_ID\"}")"
+device_code="$(printf '%s' "$resp" | jq -r '.device_code // empty')"
+user_code="$(printf '%s' "$resp" | jq -r '.user_code // empty')"
+verify="$(printf '%s' "$resp" | jq -r '.verification_uri_complete // .verification_uri // empty')"
+interval="$(printf '%s' "$resp" | jq -r '.interval // 5')"
+expires="$(printf '%s' "$resp" | jq -r '.expires_in // 900')"
+
+if [ -z "$device_code" ]; then
+  echo "error: could not start the device grant: $resp"; exit 1
+fi
+
+cat <<EOF
+
+  Approve Telereader for this device in your browser:
+
+      $verify
+
+  (code: $user_code — sign in if asked)
+
+  Waiting for approval…
+EOF
+
+deadline=$(( $(date +%s) + expires ))
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  sleep "$interval"
+  tok="$(curl -fsS -X POST "$BASE/api/auth/device/token" \
+    -H 'content-type: application/json' \
+    -d "{\"grant_type\":\"urn:ietf:params:oauth:grant-type:device_code\",\"device_code\":\"$device_code\",\"client_id\":\"$CLIENT_ID\"}" \
+    2>/dev/null || true)"
+  err="$(printf '%s' "$tok" | jq -r '.error // empty' 2>/dev/null || true)"
+  case "$err" in
+    authorization_pending) continue ;;
+    slow_down) interval=$(( interval + 5 )); continue ;;
+    "") : ;;
+    *) echo "  auth error: $err"; exit 1 ;;
+  esac
+  access="$(printf '%s' "$tok" | jq -r '.access_token // empty' 2>/dev/null || true)"
+  if [ -n "$access" ]; then
+    mkdir -p "$CONFIG_DIR"
+    ( umask 077; printf '%s' "$access" > "$TOKEN_FILE" )
+    echo "  ✓ Onboarded. Token saved to $TOKEN_FILE — reuse it; re-onboard only if it expires."
+    exit 0
+  fi
+done
+
+echo "  timed out waiting for approval — re-run to try again"
+exit 1

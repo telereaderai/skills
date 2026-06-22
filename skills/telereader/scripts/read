@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Telereader skill — submit text and print the openable reader URL.
+# Usage:
+#   read "Some text to read aloud."        # literal text
+#   read article.md --title "My article"   # a file
+#   pbpaste | read -                       # stdin
+set -euo pipefail
+
+BASE="${TELEREADER_BASE_URL:-https://telereader.ai}"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/telereader"
+TOKEN_FILE="$CONFIG_DIR/token"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+command -v jq >/dev/null 2>&1 || { echo "error: 'jq' is required (see the repo README)"; exit 1; }
+
+TOKEN="${TELEREADER_TOKEN:-}"
+[ -z "$TOKEN" ] && [ -f "$TOKEN_FILE" ] && TOKEN="$(cat "$TOKEN_FILE")"
+if [ -z "$TOKEN" ]; then
+  echo "Not onboarded. Run:  $HERE/onboard"; exit 1
+fi
+
+TITLE=""; VOICE=""; POSITIONAL=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --title) TITLE="${2:-}"; shift 2 ;;
+    --voice) VOICE="${2:-}"; shift 2 ;;
+    --) shift; while [ "$#" -gt 0 ]; do POSITIONAL+=("$1"); shift; done ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+
+if [ "${#POSITIONAL[@]}" -gt 0 ] && [ "${POSITIONAL[0]}" != "-" ]; then
+  if [ -f "${POSITIONAL[0]}" ]; then
+    BODY="$(cat "${POSITIONAL[0]}")"
+  else
+    BODY="${POSITIONAL[*]}"
+  fi
+else
+  BODY="$(cat)"   # stdin (also when the arg is "-")
+fi
+
+if [ -z "${BODY//[[:space:]]/}" ]; then
+  echo "no text to read (pass a string, a file, or pipe text on stdin)"; exit 1
+fi
+
+payload="$(jq -n --arg body "$BODY" --arg title "$TITLE" --arg voice "$VOICE" '
+  {source: {kind: "markdown", body: $body}}
+  + (if $title != "" then {title: $title} else {} end)
+  + (if $voice != "" then {voice: $voice} else {} end)')"
+
+# The token goes via --config (process substitution) so it never appears in argv
+# (i.e. never shows up in `ps`).
+resp="$(curl -fsS -X POST "$BASE/api/v1/readings" \
+  -H 'content-type: application/json' \
+  --data "$payload" \
+  --config <(printf 'header = "Authorization: Bearer %s"\n' "$TOKEN"))"
+
+readUrl="$(printf '%s' "$resp" | jq -r '.readUrl // empty')"
+if [ -z "$readUrl" ]; then
+  echo "unexpected response: $resp"; exit 1
+fi
+
+printf '%s\n' "$readUrl"
+# Best-effort open on a desktop.
+if command -v open >/dev/null 2>&1; then open "$readUrl" >/dev/null 2>&1 || true
+elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$readUrl" >/dev/null 2>&1 || true
+fi
