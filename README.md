@@ -34,8 +34,9 @@ After that, ask your agent to read text aloud and it will hand you a link.
 
 ## Requirements
 
-- **curl** — HTTP client (usually preinstalled)
-- **jq** — JSON processor (`brew install jq` / `apt install jq`)
+- **node** (≥ 18) — the helper scripts are node, and `npx skills` already needs it.
+  No other dependencies: the scripts use node's built-in `fetch` and standard
+  library (no `curl` / `jq` needed).
 
 ## In a chat assistant instead? Use the MCP server
 

@@ -1,6 +1,6 @@
 ---
 name: telereader
-description: Turn any text, article, or document into a narrated audiobook the user can open in a browser and listen to, with the words lit up in sync. Use when the user wants text "read aloud", an audiobook / listenable version, or to send a reading to themselves. Works from a shell; a free caller is never paywalled.
+description: Turn any text, article, URL, or document into a narrated audiobook the user can open in a browser and listen to, with the words lit up in sync. Use when the user wants text "read aloud", an audiobook / listenable version, or to send a reading to themselves. Works from a shell; pasting text is never paywalled (URL/document import is a paid feature — fall back to passing the text).
 homepage: https://telereader.ai
 license: MIT
 ---
@@ -13,8 +13,14 @@ license: MIT
 # Telereader — text → narrated audiobook
 
 Telereader turns text into a narrated reading the user can **open in a browser and
-listen to** — the words light up in sync with the voice. A free caller is **never**
-dead-ended: you always get back an openable URL.
+listen to** — the words light up in sync with the voice. Pasting text is **never**
+dead-ended: you always get back an openable URL. (Importing a URL or document is a
+paid feature; on the free tier, fall back to fetching the text and passing it.)
+
+You can submit **text, a URL, or a file** — Telereader fetches, extracts, and
+cleans URLs/documents server-side, so **don't fetch or clean content yourself.**
+The reader URL is **openable immediately** (progressive render) — hand it over
+right away and **offer** to open it; don't poll, and don't auto-open.
 
 Base URL: `https://telereader.ai`
 
@@ -75,25 +81,58 @@ curl -s -X POST https://telereader.ai/api/auth/device/token \
 ```
 </details>
 
-## Step 1 — read text aloud → get an openable URL
+## Step 1 — read something aloud → get an openable URL
+
+You can pass **text, a URL, or a file** — Telereader does the fetching, extraction,
+and cleaning itself. **Do NOT fetch or clean the content yourself.**
 
 ```bash
-<skill_dir>/scripts/read "Some text to read aloud."
-# or from a file:   <skill_dir>/scripts/read article.md --title "My article"
-# or from stdin:    pbpaste | <skill_dir>/scripts/read -
+<skill_dir>/scripts/read "Some text to read aloud."        # literal text
+<skill_dir>/scripts/read https://example.com/article       # a URL — Telereader fetches + cleans it
+<skill_dir>/scripts/read article.md --title "My article"   # a readable local file
+pbpaste | <skill_dir>/scripts/read -                       # stdin
 ```
 
-It prints the **readUrl** (and opens it if `open` is available). **Always hand the
-human the readUrl** — `open "$readUrl"` and it plays: text on screen, in sync with
-the narration.
+It prints the **readUrl** to stdout (and a short `(mode; request-id …)` line to
+stderr so you have a trace id). It **does not** auto-open — pass `--open` if you
+actually want it opened.
+
+The readUrl is **openable immediately** — Telereader renders progressively, so the
+human can open it and start listening while the rest generates. **Do not poll or
+wait for generation to finish before handing over the link.**
+
+**Hand the human the readUrl right away, and offer to open it** — don't open it
+silently. For example:
+
+> Here's your audiobook: `https://telereader.ai/r/…`
+> Want me to open it for you? (`open <url>` on macOS) If not, the URL above plays
+> it: text on screen, lit up in sync with the narration.
+
+**URL / document import is a paid feature.** If the caller is on the free tier, a
+URL or file import returns **`402`** and the helper prints a clear fallback. In
+that case, **fetch the page/document text yourself and pass it as text** instead —
+text is never paywalled.
+
+If a call fails (e.g. a `5xx`), the helper prints the **request id** (`x-request-id`
+/ `cf-ray`) on stderr — surface that id to the human and **offer to file a bug
+report**.
 
 <details><summary>By hand, without the helper</summary>
 
 ```bash
-curl -s -X POST https://telereader.ai/api/v1/readings \
+# text / markdown:
+curl -sS -D - -X POST https://telereader.ai/api/v1/readings \
   -H "Authorization: Bearer <TOKEN>" -H 'content-type: application/json' \
   -d '{"source":{"kind":"markdown","body":"# Title\n\nThe text to read aloud."}}'
+
+# a URL (Telereader fetches + extracts + cleans it — don't pre-fetch it yourself):
+curl -sS -D - -X POST https://telereader.ai/api/v1/readings \
+  -H "Authorization: Bearer <TOKEN>" -H 'content-type: application/json' \
+  -d '{"source":{"kind":"url","url":"https://example.com/article"}}'
 ```
+
+`-D -` dumps the response headers — keep `x-request-id` / `cf-ray` so you have a
+trace id to report on failure.
 
 Returns **`202` immediately**:
 - `{"mode":"browser","readUrl":"…"}` — free / over-cap: the URL generates the audio
@@ -113,8 +152,11 @@ curl -s https://telereader.ai/api/v1/readings/<readingId> -H "Authorization: Bea
 
 `source` is the only required field:
 - `{"kind":"text","body":"…"}` or `{"kind":"markdown","body":"…"}` (≤ 1,000,000 chars)
-- `{"kind":"url","url":"https://…"}` or `{"kind":"upload",…}` — document import; if not
-  yet available you get `422 extraction_failed`, so prefer pasting the text.
+- `{"kind":"url","url":"https://…"}` or `{"kind":"upload",…}` — **URL / document
+  import**: Telereader fetches, extracts, and cleans it server-side, so don't
+  pre-fetch it yourself. This is a **paid** feature — a free-tier caller gets a
+  `402` (fall back to passing the text). If extraction itself fails you get a
+  `422 extraction_failed`; submit the text directly.
 
 Optional: `voice`, `title`, `ephemeral` (bool), `idempotencyKey`. Re-submitting the
 same content + key is idempotent (one reading). You can also pass the key as a
@@ -126,10 +168,15 @@ header: `-H "Idempotency-Key: <key>"`.
 |---|---|---|
 | 401 | `unauthorized` | onboard (Step 0) and send the Bearer token |
 | 400 | `validation_failed` | fix the body (carries `zodError`) |
+| 402 | `payment_required` | URL / document **import** is paid — fetch the text yourself and submit it as text |
 | 429 | `rate_limited` | wait `Retry-After` seconds, then retry |
 | 422 | `extraction_failed` | url/upload import failed — submit the text directly |
 
-A free caller is **never** `402`'d — you get a browser `readUrl` instead.
+A free caller is **never paywalled for text** — text always yields a browser
+`readUrl`. Only **URL / document import** is paid; a free caller importing a URL
+gets `402`, so fall back to fetching the text and passing it as text. On any
+failure, the helper prints the response's `x-request-id` / `cf-ray` — surface that
+id and offer to file a bug report.
 
 ## Machine spec
 

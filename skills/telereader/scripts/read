@@ -1,69 +1,124 @@
-#!/usr/bin/env bash
-# Telereader skill — submit text and print the openable reader URL.
-# Usage:
-#   read "Some text to read aloud."        # literal text
-#   read article.md --title "My article"   # a file
-#   pbpaste | read -                       # stdin
-set -euo pipefail
+#!/usr/bin/env node
+// Telereader skill — submit text/a URL/a file and print the openable reader URL.
+// Ported from bash to node for a stable, fast runtime (node is guaranteed: `npx
+// skills` requires it). The old bash empty-body check span-locked macOS bash 3.2
+// on large inputs; this is O(n) and instant.
+//
+// Usage:
+//   read "Some text to read aloud."          # literal text
+//   read https://example.com/article         # a URL — Telereader fetches+cleans it
+//   read article.md --title "My article"     # a readable local file
+//   pbpaste | read -                         # stdin
+// Flags: --title <t>  --voice <v>  --open (off by default; we never auto-open)
+//
+// The token comes from $TELEREADER_TOKEN or ~/.config/telereader/token — NEVER
+// from argv, so it can't leak into `ps`.
+'use strict';
 
-BASE="${TELEREADER_BASE_URL:-https://telereader.ai}"
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/telereader"
-TOKEN_FILE="$CONFIG_DIR/token"
-# CDPATH= disables CDPATH lookup (a multi-entry CDPATH can make `cd <relative>`
-# resolve elsewhere and echo the path, corrupting this capture); -- guards odd dirs.
-HERE="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+const { spawn } = require('node:child_process');
+const lib = require('./lib.js');
 
-command -v jq >/dev/null 2>&1 || { echo "error: 'jq' is required (see the repo README)"; exit 1; }
+function readStdin() {
+  return new Promise((resolve) => {
+    if (process.stdin.isTTY) { resolve(''); return; }
+    let buf = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (c) => { buf += c; });
+    process.stdin.on('end', () => resolve(buf));
+    process.stdin.on('error', () => resolve(buf));
+  });
+}
 
-TOKEN="${TELEREADER_TOKEN:-}"
-[ -z "$TOKEN" ] && [ -f "$TOKEN_FILE" ] && TOKEN="$(cat "$TOKEN_FILE")"
-if [ -z "$TOKEN" ]; then
-  echo "Not onboarded. Run:  $HERE/onboard"; exit 1
-fi
+function parseArgs(argv) {
+  const out = { title: '', voice: '', open: false, positional: [] };
+  let i = 0;
+  let passthrough = false;
+  while (i < argv.length) {
+    const a = argv[i];
+    if (passthrough) { out.positional.push(a); i += 1; continue; }
+    switch (a) {
+      case '--title': out.title = argv[i + 1] || ''; i += 2; break;
+      case '--voice': out.voice = argv[i + 1] || ''; i += 2; break;
+      case '--open': out.open = true; i += 1; break;
+      case '--': passthrough = true; i += 1; break;
+      default: out.positional.push(a); i += 1; break;
+    }
+  }
+  return out;
+}
 
-TITLE=""; VOICE=""; POSITIONAL=()
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --title) TITLE="${2:-}"; shift 2 ;;
-    --voice) VOICE="${2:-}"; shift 2 ;;
-    --) shift; while [ "$#" -gt 0 ]; do POSITIONAL+=("$1"); shift; done ;;
-    *) POSITIONAL+=("$1"); shift ;;
-  esac
-done
+function openInBrowser(url) {
+  const cmd = process.platform === 'darwin' ? 'open'
+    : process.platform === 'win32' ? 'cmd'
+      : 'xdg-open';
+  const args = process.platform === 'win32' ? ['/c', 'start', '', url] : [url];
+  try {
+    const child = spawn(cmd, args, { stdio: 'ignore', detached: true });
+    child.on('error', () => {});
+    child.unref();
+  } catch { /* best effort */ }
+}
 
-if [ "${#POSITIONAL[@]}" -gt 0 ] && [ "${POSITIONAL[0]}" != "-" ]; then
-  if [ -f "${POSITIONAL[0]}" ]; then
-    BODY="$(cat "${POSITIONAL[0]}")"
-  else
-    BODY="${POSITIONAL[*]}"
-  fi
-else
-  BODY="$(cat)"   # stdin (also when the arg is "-")
-fi
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const firstPositional = args.positional[0];
+  const needStdin = firstPositional == null || firstPositional === '-';
+  const stdinBody = needStdin ? await readStdin() : '';
 
-if [ -z "${BODY//[[:space:]]/}" ]; then
-  echo "no text to read (pass a string, a file, or pipe text on stdin)"; exit 1
-fi
+  const source = lib.resolveSource(firstPositional, stdinBody);
 
-payload="$(jq -n --arg body "$BODY" --arg title "$TITLE" --arg voice "$VOICE" '
-  {source: {kind: "markdown", body: $body}}
-  + (if $title != "" then {title: $title} else {} end)
-  + (if $voice != "" then {voice: $voice} else {} end)')"
+  // Blank-check only the inline-body sources (url sources have no body).
+  if (source.kind !== 'url' && lib.isBlank(source.body)) {
+    process.stderr.write('no text to read (pass a string, a URL, a file, or pipe text on stdin)\n');
+    process.exit(1);
+  }
 
-# The token goes via --config (process substitution) so it never appears in argv
-# (i.e. never shows up in `ps`).
-resp="$(curl -fsS -X POST "$BASE/api/v1/readings" \
-  -H 'content-type: application/json' \
-  --data "$payload" \
-  --config <(printf 'header = "Authorization: Bearer %s"\n' "$TOKEN"))"
+  if (!lib.readToken()) {
+    process.stderr.write('Not onboarded. Run the onboard script next to this one (scripts/onboard).\n');
+    process.exit(1);
+  }
 
-readUrl="$(printf '%s' "$resp" | jq -r '.readUrl // empty')"
-if [ -z "$readUrl" ]; then
-  echo "unexpected response: $resp"; exit 1
-fi
+  try {
+    const { readUrl, mode, ids } = await lib.submitReading({
+      source, title: args.title, voice: args.voice,
+    });
+    // Print the readUrl. We DO NOT auto-open — the agent offers to open it.
+    process.stdout.write(readUrl + '\n');
+    const idStr = lib.formatTraceIds(ids);
+    if (idStr) process.stderr.write(`(${mode || 'ok'}; ${idStr})\n`);
+    if (args.open) openInBrowser(readUrl);
+    process.exit(0);
+  } catch (err) {
+    const ids = err.ids || {};
+    const idStr = lib.formatTraceIds(ids);
+    const idSuffix = idStr ? ` [${idStr}]` : '';
 
-printf '%s\n' "$readUrl"
-# Best-effort open on a desktop.
-if command -v open >/dev/null 2>&1; then open "$readUrl" >/dev/null 2>&1 || true
-elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$readUrl" >/dev/null 2>&1 || true
-fi
+    if (err.status === 402) {
+      process.stderr.write(
+        'Telereader returned 402 Payment Required — URL/document import is a paid ' +
+        'feature on this account.\n' +
+        'Fallback: fetch the page/document text yourself and pass it as text, e.g.\n' +
+        '  read "<the extracted text>"   (or pipe it on stdin: ... | read -)\n' +
+        `${err.message ? 'detail: ' + err.message + '\n' : ''}${idSuffix ? 'trace:' + idSuffix + '\n' : ''}`,
+      );
+      process.exit(2);
+    }
+
+    if (err.code === 'not_onboarded') {
+      process.stderr.write('Not onboarded. Run the onboard script (scripts/onboard).\n');
+      process.exit(1);
+    }
+
+    process.stderr.write(
+      `error: ${err.code}${err.status ? ' (HTTP ' + err.status + ')' : ''}${idSuffix}\n` +
+      `${err.message ? err.message + '\n' : ''}` +
+      (err.status >= 500 ? 'This looks like a server error — report the trace id above and offer to file a bug.\n' : ''),
+    );
+    process.exit(1);
+  }
+}
+
+main().catch((err) => {
+  process.stderr.write(`unexpected error: ${err && err.stack ? err.stack : err}\n`);
+  process.exit(1);
+});
