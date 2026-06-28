@@ -1,64 +1,89 @@
-#!/usr/bin/env bash
-# Telereader skill — one-time device-grant onboarding (RFC 8628).
-# Requests a device code, hands the human a browser approval link, polls for the
-# token, and saves it (mode 0600) to ~/.config/telereader/token. No secret is
-# ever printed.
-set -euo pipefail
+#!/usr/bin/env node
+// Telereader skill — one-time device-grant onboarding (RFC 8628), ported from
+// bash to node. Requests a device code, hands the human a browser approval link,
+// polls for the token, and saves it (mode 0600) to ~/.config/telereader/token.
+// No secret is ever printed. Human-in-the-loop: you cannot approve on their behalf.
+'use strict';
 
-BASE="${TELEREADER_BASE_URL:-https://telereader.ai}"
-CLIENT_ID="${TELEREADER_CLIENT_ID:-tlread}"
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/telereader"
-TOKEN_FILE="$CONFIG_DIR/token"
+const lib = require('./lib.js');
 
-for dep in curl jq; do
-  command -v "$dep" >/dev/null 2>&1 || { echo "error: '$dep' is required (see the repo README)"; exit 1; }
-done
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-resp="$(curl -fsS -X POST "$BASE/api/auth/device/code" \
-  -H 'content-type: application/json' -d "{\"client_id\":\"$CLIENT_ID\"}")"
-device_code="$(printf '%s' "$resp" | jq -r '.device_code // empty')"
-user_code="$(printf '%s' "$resp" | jq -r '.user_code // empty')"
-verify="$(printf '%s' "$resp" | jq -r '.verification_uri_complete // .verification_uri // empty')"
-interval="$(printf '%s' "$resp" | jq -r '.interval // 5')"
-expires="$(printf '%s' "$resp" | jq -r '.expires_in // 900')"
+async function postJson(url, body, fetchImpl) {
+  const res = await fetchImpl(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { /* keep null */ }
+  return { res, data, text };
+}
 
-if [ -z "$device_code" ]; then
-  echo "error: could not start the device grant: $resp"; exit 1
-fi
+async function main() {
+  const env = process.env;
+  const fetchImpl = fetch;
+  const base = lib.baseUrl(env);
+  const client_id = lib.clientId(env);
 
-cat <<EOF
+  // (a) request a device code
+  const start = await postJson(`${base}/api/auth/device/code`, { client_id }, fetchImpl);
+  if (!start.res.ok || !start.data || !start.data.device_code) {
+    process.stderr.write(`error: could not start the device grant: ${start.text || start.res.status}\n`);
+    process.exit(1);
+  }
+  const deviceCode = start.data.device_code;
+  const userCode = start.data.user_code || '';
+  const verify = start.data.verification_uri_complete || start.data.verification_uri || '';
+  let interval = Number(start.data.interval) || 5;
+  const expires = Number(start.data.expires_in) || 900;
 
-  Approve Telereader for this device in your browser:
+  // (b) tell the human to approve in their browser
+  process.stdout.write(
+    `\n  Approve Telereader for this device in your browser:\n\n` +
+    `      ${verify}\n\n` +
+    (userCode ? `  (code: ${userCode} — sign in if asked)\n\n` : '') +
+    `  Waiting for approval…\n`,
+  );
 
-      $verify
+  // (c) poll for the token until approval or expiry
+  const deadline = Date.now() + expires * 1000;
+  while (Date.now() < deadline) {
+    await sleep(interval * 1000);
+    let poll;
+    try {
+      poll = await postJson(`${base}/api/auth/device/token`, {
+        grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+        device_code: deviceCode,
+        client_id,
+      }, fetchImpl);
+    } catch {
+      continue; // transient network blip — keep polling
+    }
+    const data = poll.data || {};
+    if (data.access_token) {
+      const file = lib.saveToken(data.access_token, env);
+      process.stdout.write(
+        `  ✓ Onboarded. Token saved to ${file} — reuse it; re-onboard only if it expires.\n`,
+      );
+      process.exit(0);
+    }
+    switch (data.error) {
+      case 'authorization_pending': continue;
+      case 'slow_down': interval += 5; continue;
+      case undefined: case null: case '': continue; // no token yet, no error — keep waiting
+      default:
+        process.stderr.write(`  auth error: ${data.error}\n`);
+        process.exit(1);
+    }
+  }
 
-  (code: $user_code — sign in if asked)
+  process.stderr.write('  timed out waiting for approval — re-run to try again\n');
+  process.exit(1);
+}
 
-  Waiting for approval…
-EOF
-
-deadline=$(( $(date +%s) + expires ))
-while [ "$(date +%s)" -lt "$deadline" ]; do
-  sleep "$interval"
-  tok="$(curl -fsS -X POST "$BASE/api/auth/device/token" \
-    -H 'content-type: application/json' \
-    -d "{\"grant_type\":\"urn:ietf:params:oauth:grant-type:device_code\",\"device_code\":\"$device_code\",\"client_id\":\"$CLIENT_ID\"}" \
-    2>/dev/null || true)"
-  err="$(printf '%s' "$tok" | jq -r '.error // empty' 2>/dev/null || true)"
-  case "$err" in
-    authorization_pending) continue ;;
-    slow_down) interval=$(( interval + 5 )); continue ;;
-    "") : ;;
-    *) echo "  auth error: $err"; exit 1 ;;
-  esac
-  access="$(printf '%s' "$tok" | jq -r '.access_token // empty' 2>/dev/null || true)"
-  if [ -n "$access" ]; then
-    mkdir -p "$CONFIG_DIR"
-    ( umask 077; printf '%s' "$access" > "$TOKEN_FILE" )
-    echo "  ✓ Onboarded. Token saved to $TOKEN_FILE — reuse it; re-onboard only if it expires."
-    exit 0
-  fi
-done
-
-echo "  timed out waiting for approval — re-run to try again"
-exit 1
+main().catch((err) => {
+  process.stderr.write(`unexpected error: ${err && err.stack ? err.stack : err}\n`);
+  process.exit(1);
+});
